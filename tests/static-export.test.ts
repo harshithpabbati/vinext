@@ -383,11 +383,12 @@ describe("prerenderMode — Pages Router (auto build-time pre-rendering)", () =>
     expect(fs.existsSync(path.join(prerenderDir, "ssr.html"))).toBe(false);
   });
 
-  it("skips dynamic routes without getStaticPaths", () => {
-    // products/[pid].tsx has no getStaticPaths in prerender mode — skip
-    const hasPidFile = fs.existsSync(path.join(prerenderDir, "products"))
-      && fs.readdirSync(path.join(prerenderDir, "products")).some(f => f.endsWith(".html"));
-    expect(hasPidFile).toBe(false);
+  it("pre-renders dynamic routes with getStaticPaths (any fallback value)", () => {
+    // products/[pid].tsx has getStaticPaths with fallback: true and known paths
+    // (widget, gadget). In prerenderMode we allow any fallback and render the
+    // known paths — matching Next.js's Automatic Static Optimization behavior.
+    expect(fs.existsSync(path.join(prerenderDir, "products", "widget.html"))).toBe(true);
+    expect(fs.existsSync(path.join(prerenderDir, "products", "gadget.html"))).toBe(true);
   });
 
   it("pre-renders dynamic routes that have getStaticPaths", () => {
@@ -401,9 +402,13 @@ describe("prerenderMode — Pages Router (auto build-time pre-rendering)", () =>
     expect(html).toContain("About");
   });
 
-  it("does not generate a 404.html in prerenderMode", () => {
-    // In prerenderMode we don't export 404 — the prod server handles it
-    expect(fs.existsSync(path.join(prerenderDir, "404.html"))).toBe(false);
+  it("pre-renders pages/404.tsx as a static page", () => {
+    // pages/404.tsx is a plain static page with no getServerSideProps —
+    // it is correctly pre-rendered to 404.html (the prod server will serve it
+    // for 404 responses, and it's also available as a cached static file).
+    expect(fs.existsSync(path.join(prerenderDir, "404.html"))).toBe(true);
+    const html = fs.readFileSync(path.join(prerenderDir, "404.html"), "utf-8");
+    expect(html).toContain("404");
   });
 });
 
