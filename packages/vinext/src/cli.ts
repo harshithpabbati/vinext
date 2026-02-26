@@ -351,18 +351,15 @@ async function buildApp() {
   const devServerConfig = buildViteConfig({ logLevel: "silent" });
 
   if (isApp) {
+    // Build-time pre-rendering uses in-process rendering — no HTTP server needed.
     const server = await vite.createServer(devServerConfig);
-    await server.listen();
-    const addr = server.httpServer?.address();
-    const port = typeof addr === "object" && addr ? addr.port : 3000;
-    const baseUrl = `http://localhost:${port}`;
 
     try {
       const { appRouter } = await import("./routing/app-router.js");
       const appDir = resolveDir("app");
       const routes = await appRouter(appDir);
       const result = await staticExportApp({
-        baseUrl, routes, appDir, server,
+        routes, appDir, server,
         outDir: prerenderDir,
         config: nextConfig,
         prerenderMode: true,

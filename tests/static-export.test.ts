@@ -414,13 +414,15 @@ describe("prerenderMode — Pages Router (auto build-time pre-rendering)", () =>
 
 describe("prerenderMode — App Router (auto build-time pre-rendering)", () => {
   let viteServer: ViteDevServer;
-  let viteBaseUrl: string;
   const prerenderDir = path.resolve(APP_FIXTURE, "prerendered-test");
 
   beforeAll(async () => {
-    const vite = await startFixtureServer(APP_FIXTURE, { appRouter: true });
-    viteServer = vite.server;
-    viteBaseUrl = vite.baseUrl;
+    // Build-time pre-rendering uses in-process rendering — no HTTP server needed.
+    viteServer = await createViteServer({
+      root: APP_FIXTURE,
+      configFile: path.join(APP_FIXTURE, "vite.config.ts"),
+      logLevel: "silent",
+    });
 
     const { staticExportApp } = await import(
       "../packages/vinext/src/build/static-export.js"
@@ -437,7 +439,6 @@ describe("prerenderMode — App Router (auto build-time pre-rendering)", () => {
     const config = await resolveNextConfig({});
 
     await staticExportApp({
-      baseUrl: viteBaseUrl,
       routes,
       appDir,
       server: viteServer,
