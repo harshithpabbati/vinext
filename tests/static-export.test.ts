@@ -325,3 +325,161 @@ describe("Static export — App Router (served via HTTP)", () => {
     expect(aboutHtml).toContain("About");
   });
 });
+
+// ─── prerenderMode: auto build-time pre-rendering ───────────────────────────
+//
+// Tests the new `prerenderMode: true` option which enables automatic static
+// page detection and pre-rendering during a normal server build.
+// This matches Next.js's "Automatic Static Optimization" — pages that don't
+// use dynamic APIs are pre-rendered to HTML, while dynamic pages are skipped.
+
+describe("prerenderMode — Pages Router (auto build-time pre-rendering)", () => {
+  let viteServer: ViteDevServer;
+  const prerenderDir = path.resolve(PAGES_FIXTURE, "prerendered-test");
+
+  beforeAll(async () => {
+    const vite = await startFixtureServer(PAGES_FIXTURE);
+    viteServer = vite.server;
+
+    const { staticExportPages } = await import(
+      "../packages/vinext/src/build/static-export.js"
+    );
+    const { pagesRouter } = await import(
+      "../packages/vinext/src/routing/pages-router.js"
+    );
+    const { resolveNextConfig } = await import(
+      "../packages/vinext/src/config/next-config.js"
+    );
+
+    const pagesDir = path.resolve(PAGES_FIXTURE, "pages");
+    const routes = await pagesRouter(pagesDir);
+    const pageRoutes = routes.filter((r: any) => !r.filePath.includes("/api/"));
+    const apiRoutes = routes.filter((r: any) => r.filePath.includes("/api/"));
+    const config = await resolveNextConfig({});
+
+    await staticExportPages({
+      server: viteServer,
+      routes: pageRoutes,
+      apiRoutes,
+      pagesDir,
+      outDir: prerenderDir,
+      config,
+      prerenderMode: true,
+    });
+  }, 30_000);
+
+  afterAll(async () => {
+    await viteServer?.close();
+    fs.rmSync(prerenderDir, { recursive: true, force: true });
+  });
+
+  it("pre-renders static pages (no getServerSideProps)", () => {
+    // about.tsx is a pure static page — should be pre-rendered
+    expect(fs.existsSync(path.join(prerenderDir, "about.html"))).toBe(true);
+  });
+
+  it("skips getServerSideProps pages (dynamic)", () => {
+    // ssr.tsx uses getServerSideProps — must NOT be pre-rendered
+    expect(fs.existsSync(path.join(prerenderDir, "ssr.html"))).toBe(false);
+  });
+
+  it("pre-renders dynamic routes with getStaticPaths (any fallback value)", () => {
+    // products/[pid].tsx has getStaticPaths with fallback: true and known paths
+    // (widget, gadget). In prerenderMode we allow any fallback and render the
+    // known paths — matching Next.js's Automatic Static Optimization behavior.
+    expect(fs.existsSync(path.join(prerenderDir, "products", "widget.html"))).toBe(true);
+    expect(fs.existsSync(path.join(prerenderDir, "products", "gadget.html"))).toBe(true);
+  });
+
+  it("pre-renders dynamic routes that have getStaticPaths", () => {
+    // blog/[slug].tsx has getStaticPaths with known slugs
+    expect(fs.existsSync(path.join(prerenderDir, "blog", "hello-world.html"))).toBe(true);
+  });
+
+  it("pre-rendered static HTML is valid", () => {
+    const html = fs.readFileSync(path.join(prerenderDir, "about.html"), "utf-8");
+    expect(html).toContain("<!DOCTYPE html>");
+    expect(html).toContain("About");
+  });
+
+  it("pre-renders pages/404.tsx as a static page", () => {
+    // pages/404.tsx is a plain static page with no getServerSideProps —
+    // it is correctly pre-rendered to 404.html (the prod server will serve it
+    // for 404 responses, and it's also available as a cached static file).
+    expect(fs.existsSync(path.join(prerenderDir, "404.html"))).toBe(true);
+    const html = fs.readFileSync(path.join(prerenderDir, "404.html"), "utf-8");
+    expect(html).toContain("404");
+  });
+});
+
+describe("prerenderMode — App Router (auto build-time pre-rendering)", () => {
+  let viteServer: ViteDevServer;
+  const prerenderDir = path.resolve(APP_FIXTURE, "prerendered-test");
+
+  beforeAll(async () => {
+    // Build-time pre-rendering uses in-process rendering — no HTTP server needed.
+    viteServer = await createViteServer({
+      root: APP_FIXTURE,
+      configFile: path.join(APP_FIXTURE, "vite.config.ts"),
+      logLevel: "silent",
+    });
+
+    const { staticExportApp } = await import(
+      "../packages/vinext/src/build/static-export.js"
+    );
+    const { appRouter } = await import(
+      "../packages/vinext/src/routing/app-router.js"
+    );
+    const { resolveNextConfig } = await import(
+      "../packages/vinext/src/config/next-config.js"
+    );
+
+    const appDir = path.resolve(APP_FIXTURE, "app");
+    const routes = await appRouter(appDir);
+    const config = await resolveNextConfig({});
+
+    await staticExportApp({
+      routes,
+      appDir,
+      server: viteServer,
+      outDir: prerenderDir,
+      config,
+      prerenderMode: true,
+    });
+  }, 30_000);
+
+  afterAll(async () => {
+    await viteServer?.close();
+    fs.rmSync(prerenderDir, { recursive: true, force: true });
+  });
+
+  it("pre-renders pure static pages", () => {
+    // app/page.tsx has no dynamic API calls — should be pre-rendered
+    expect(fs.existsSync(path.join(prerenderDir, "index.html"))).toBe(true);
+  });
+
+  it("pre-renders static about page", () => {
+    expect(fs.existsSync(path.join(prerenderDir, "about.html"))).toBe(true);
+  });
+
+  it("pre-renders dynamic route pages that have generateStaticParams", () => {
+    // blog/[slug]/page.tsx has generateStaticParams returning hello-world, etc.
+    expect(fs.existsSync(path.join(prerenderDir, "blog", "hello-world.html"))).toBe(true);
+  });
+
+  it("skips pages that use dynamic APIs (cookies/headers)", () => {
+    // headers-test/page.tsx calls cookies() and headers() → must NOT be pre-rendered
+    expect(fs.existsSync(path.join(prerenderDir, "headers-test.html"))).toBe(false);
+  });
+
+  it("pre-rendered HTML is valid and contains page content", () => {
+    const html = fs.readFileSync(path.join(prerenderDir, "index.html"), "utf-8");
+    expect(html).toContain("<!DOCTYPE html>");
+    expect(html).toContain("Welcome to App Router");
+  });
+
+  it("does not generate a 404.html in prerenderMode", () => {
+    // In prerenderMode we don't export 404 — the prod server handles it
+    expect(fs.existsSync(path.join(prerenderDir, "404.html"))).toBe(false);
+  });
+});

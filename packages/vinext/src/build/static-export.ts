@@ -57,6 +57,14 @@ export interface StaticExportOptions {
   outDir: string;
   /** Resolved next.config.js */
   config: ResolvedNextConfig;
+  /**
+   * When true, enables automatic build-time pre-rendering mode:
+   * - Skips pages with getServerSideProps (instead of erroring)
+   * - Skips dynamic routes without getStaticPaths (instead of erroring)
+   * - Allows getStaticPaths with any fallback value (renders known paths)
+   * Use this when pre-rendering as part of a normal server build (not output:'export').
+   */
+  prerenderMode?: boolean;
 }
 
 export interface StaticExportResult {
@@ -79,6 +87,7 @@ export async function staticExportPages(
   options: StaticExportOptions,
 ): Promise<StaticExportResult> {
   const { server, routes, apiRoutes, pagesDir, outDir, config } = options;
+  const prerenderMode = options.prerenderMode ?? false;
   const result: StaticExportResult = {
     pageCount: 0,
     files: [],
@@ -90,7 +99,7 @@ export async function staticExportPages(
   fs.mkdirSync(outDir, { recursive: true });
 
   // Warn about API routes
-  if (apiRoutes.length > 0) {
+  if (!prerenderMode && apiRoutes.length > 0) {
     result.warnings.push(
       `${apiRoutes.length} API route(s) skipped — API routes are not supported with output: 'export'`,
     );
@@ -110,8 +119,12 @@ export async function staticExportPages(
 
     const pageModule = await server.ssrLoadModule(route.filePath);
 
-    // Validate: getServerSideProps is not allowed with static export
+    // getServerSideProps pages are not statically renderable
     if (typeof pageModule.getServerSideProps === "function") {
+      if (prerenderMode) {
+        // In auto-prerender mode: skip SSR pages — they'll be rendered at runtime
+        continue;
+      }
       result.errors.push({
         route: route.pattern,
         error: `Page uses getServerSideProps which is not supported with output: 'export'. Use getStaticProps instead.`,
@@ -122,6 +135,10 @@ export async function staticExportPages(
     if (route.isDynamic) {
       // Dynamic route — must have getStaticPaths
       if (typeof pageModule.getStaticPaths !== "function") {
+        if (prerenderMode) {
+          // In auto-prerender mode: skip — will be SSR'd at runtime
+          continue;
+        }
         result.errors.push({
           route: route.pattern,
           error: `Dynamic route requires getStaticPaths with output: 'export'`,
@@ -135,7 +152,7 @@ export async function staticExportPages(
       });
       const fallback = pathsResult?.fallback ?? false;
 
-      if (fallback !== false) {
+      if (!prerenderMode && fallback !== false) {
         result.errors.push({
           route: route.pattern,
           error: `getStaticPaths must return fallback: false with output: 'export' (got: ${JSON.stringify(fallback)})`,
@@ -610,8 +627,11 @@ async function resolveParentParams(
 // -------------------------------------------------------------------
 
 export interface AppStaticExportOptions {
-  /** Base URL of a running dev server (e.g. "http://localhost:5173") */
-  baseUrl: string;
+  /**
+   * Base URL of a running dev server (e.g. "http://localhost:5173").
+   * Required for output: 'export' mode. Not used in prerenderMode.
+   */
+  baseUrl?: string;
   /** Discovered app routes */
   routes: AppRoute[];
   /** App directory path (for loading modules to call generateStaticParams) */
@@ -622,18 +642,214 @@ export interface AppStaticExportOptions {
   outDir: string;
   /** Resolved next.config.js */
   config: ResolvedNextConfig;
+  /**
+   * When true, enables automatic build-time pre-rendering mode:
+   * - Pages are rendered directly in-process (no HTTP server needed)
+   * - Dynamic APIs (cookies, headers, connection) throw DynamicServerError,
+   *   causing the page to be skipped — it will be SSR'd at request time
+   * - Skips dynamic routes without generateStaticParams() (instead of erroring)
+   * Use this when pre-rendering as part of a normal server build (not output:'export').
+   */
+  prerenderMode?: boolean;
+}
+
+/**
+ * Check if an error is a DynamicServerError thrown when a dynamic API
+ * (cookies, headers, connection) is called during static generation.
+ * Uses the `digest` property so the check works across module instances.
+ */
+function isDynamicServerError(e: unknown): boolean {
+  return (
+    e instanceof Error &&
+    (e as { digest?: string }).digest === "DYNAMIC_SERVER_ERROR"
+  );
+}
+
+/**
+ * Run static export for App Router in prerenderMode.
+ *
+ * Renders each statically-determinable page directly in-process by:
+ * 1. Loading the page module and checking for explicit dynamic markers
+ *    (export const dynamic = 'force-dynamic', revalidate = 0).
+ * 2. Calling generateStaticParams() for dynamic routes.
+ * 3. Building the React layout+page tree and rendering with renderToReadableStream.
+ * 4. Entering static generation mode so that any call to cookies(), headers(),
+ *    or connection() throws DynamicServerError — causing the page to be skipped.
+ *
+ * This mirrors Next.js's build-time static optimization: pages that use dynamic
+ * APIs are detected during the render attempt and skipped automatically.
+ */
+async function prerenderAppRoutes(
+  options: Pick<AppStaticExportOptions, "routes" | "server" | "outDir" | "config">,
+  result: StaticExportResult,
+): Promise<void> {
+  const { routes, server, outDir, config } = options;
+
+  // Load the navigation shim from the Vite SSR module graph so that
+  // setNavigationContext() writes to the same instance the page components read.
+  const navigationShim = await server.ssrLoadModule("next/navigation");
+
+  // Load the headers shim to enter/exit static generation mode.
+  const headersShim = await server.ssrLoadModule("next/headers");
+
+  for (const route of routes) {
+    // Skip API route handlers — not supported in static pre-rendering
+    if (route.routePath && !route.pagePath) continue;
+    if (!route.pagePath) continue;
+
+    let pageModule: Record<string, unknown>;
+    try {
+      pageModule = await server.ssrLoadModule(route.pagePath);
+    } catch {
+      continue;
+    }
+
+    // Respect explicit dynamic markers (same as Next.js).
+    if (pageModule.dynamic === "force-dynamic") continue;
+    if (typeof pageModule.revalidate === "number" && pageModule.revalidate === 0) continue;
+
+    // Build the list of (urlPath, params) to render for this route.
+    const toRender: Array<{ urlPath: string; params: Record<string, string | string[]> }> = [];
+
+    if (route.isDynamic) {
+      if (typeof pageModule.generateStaticParams !== "function") {
+        // No generateStaticParams — skip (will be SSR'd at runtime)
+        continue;
+      }
+
+      try {
+        const parentParamSets = await resolveParentParams(route, routes, server);
+
+        let paramSets: Record<string, string | string[]>[];
+        if (parentParamSets.length > 0) {
+          paramSets = [];
+          for (const parentParams of parentParamSets) {
+            const childResults = await (pageModule.generateStaticParams as Function)({ params: parentParams });
+            if (Array.isArray(childResults)) {
+              for (const childParams of childResults) {
+                paramSets.push({ ...parentParams, ...childParams });
+              }
+            }
+          }
+        } else {
+          paramSets = await (pageModule.generateStaticParams as Function)({ params: {} });
+        }
+
+        if (!Array.isArray(paramSets) || paramSets.length === 0) {
+          result.warnings.push(
+            `generateStaticParams() for ${route.pattern} returned empty array — no pages generated`,
+          );
+          continue;
+        }
+
+        for (const params of paramSets) {
+          toRender.push({ urlPath: buildUrlFromParams(route.pattern, params), params });
+        }
+      } catch (e) {
+        result.errors.push({
+          route: route.pattern,
+          error: `Failed to call generateStaticParams(): ${(e as Error).message}`,
+        });
+        continue;
+      }
+    } else {
+      toRender.push({ urlPath: route.pattern, params: {} });
+    }
+
+    // Load layout modules for this route (from root to leaf).
+    const layoutModules: Array<Record<string, unknown>> = [];
+    for (const layoutPath of route.layouts) {
+      try {
+        layoutModules.push(await server.ssrLoadModule(layoutPath));
+      } catch {
+        layoutModules.push({});
+      }
+    }
+
+    // Render each URL in-process.
+    for (const { urlPath, params } of toRender) {
+      try {
+        // Provide navigation context so usePathname() / useParams() work.
+        if (typeof navigationShim.setNavigationContext === "function") {
+          navigationShim.setNavigationContext({
+            pathname: urlPath,
+            searchParams: new URLSearchParams(),
+            params,
+          });
+        }
+
+        // Enter static generation mode — dynamic API calls will throw DynamicServerError.
+        if (typeof headersShim.enterStaticGenerationMode === "function") {
+          headersShim.enterStaticGenerationMode();
+        }
+
+        const Page = pageModule.default as React.ComponentType<unknown>;
+        if (!Page) continue;
+
+        // Next.js 15+ passes params as a thenable (can be awaited OR accessed directly).
+        const thenableParams = Object.assign(Promise.resolve(params), params);
+
+        // Build the React tree: Page wrapped in layouts (outermost first).
+        let element: React.ReactElement = React.createElement(Page as React.ComponentType<Record<string, unknown>>, {
+          params: thenableParams,
+          searchParams: Promise.resolve({}),
+        });
+
+        for (let i = layoutModules.length - 1; i >= 0; i--) {
+          const Layout = layoutModules[i]?.default as React.ComponentType<unknown> | undefined;
+          if (Layout) {
+            element = React.createElement(Layout as React.ComponentType<Record<string, unknown>>, {
+              children: element,
+              params: thenableParams,
+            });
+          }
+        }
+
+        // Render to HTML. renderToReadableStream handles async Server Components
+        // and waits for all Suspense boundaries when allReady resolves.
+        const stream = await renderToReadableStream(element);
+        await stream.allReady;
+        const html = "<!DOCTYPE html>\n" + (await new Response(stream).text());
+
+        const outputPath = getOutputPath(urlPath, config.trailingSlash);
+        const fullPath = path.join(outDir, outputPath);
+        fs.mkdirSync(path.dirname(fullPath), { recursive: true });
+        fs.writeFileSync(fullPath, html, "utf-8");
+
+        result.files.push(outputPath);
+        result.pageCount++;
+      } catch (e) {
+        // DynamicServerError: the page called cookies(), headers(), or connection()
+        // during render — it cannot be pre-rendered and will be SSR'd at runtime.
+        if (isDynamicServerError(e)) continue;
+        // Other errors: log but continue with remaining pages.
+        result.errors.push({ route: urlPath, error: (e as Error).message });
+      } finally {
+        if (typeof headersShim.exitStaticGenerationMode === "function") {
+          headersShim.exitStaticGenerationMode();
+        }
+        if (typeof navigationShim.setNavigationContext === "function") {
+          navigationShim.setNavigationContext(null);
+        }
+      }
+    }
+  }
 }
 
 /**
  * Run static export for App Router.
  *
- * Fetches each route from a running dev server and writes the HTML to disk.
- * For dynamic routes, calls generateStaticParams() to expand all paths.
+ * In prerenderMode: renders pages directly in-process at build time (no HTTP
+ * server needed). Pages that call dynamic APIs are detected and skipped.
+ *
+ * In output:'export' mode: fetches each route from a running dev server and
+ * writes the HTML to disk. Requires baseUrl to point to a running dev server.
  */
 export async function staticExportApp(
   options: AppStaticExportOptions,
 ): Promise<StaticExportResult> {
-  const { baseUrl, routes, server, outDir, config } = options;
+  const { routes, server, outDir, config } = options;
+  const prerenderMode = options.prerenderMode ?? false;
   const result: StaticExportResult = {
     pageCount: 0,
     files: [],
@@ -642,6 +858,16 @@ export async function staticExportApp(
   };
 
   fs.mkdirSync(outDir, { recursive: true });
+
+  if (prerenderMode) {
+    // Build-time approach: render pages directly in-process.
+    await prerenderAppRoutes({ routes, server, outDir, config }, result);
+    return result;
+  }
+
+  // ── output: 'export' mode — HTTP-based rendering ────────────────────────
+  // Requires a running dev server at baseUrl.
+  const baseUrl = options.baseUrl ?? "";
 
   // Collect all URLs to render
   const urlsToRender: string[] = [];
@@ -670,14 +896,10 @@ export async function staticExportApp(
           continue;
         }
 
-        // Resolve parent dynamic segments for top-down params passing.
-        // Find all other routes whose patterns are prefixes of this route's pattern
-        // and that have dynamic params, then collect their generateStaticParams.
         const parentParamSets = await resolveParentParams(route, routes, server);
 
         let paramSets: Record<string, string | string[]>[];
         if (parentParamSets.length > 0) {
-          // Top-down: call child's generateStaticParams for each parent param set
           paramSets = [];
           for (const parentParams of parentParamSets) {
             const childResults = await pageModule.generateStaticParams({ params: parentParams });
@@ -688,7 +910,6 @@ export async function staticExportApp(
             }
           }
         } else {
-          // Bottom-up: no parent params, call with empty params
           paramSets = await pageModule.generateStaticParams({ params: {} });
         }
 

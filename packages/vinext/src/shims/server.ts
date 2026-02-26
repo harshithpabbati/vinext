@@ -430,8 +430,13 @@ export function after<T>(task: Promise<T> | (() => T | Promise<T>)): void {
  * and sets Cache-Control: no-store on the response.
  */
 export async function connection(): Promise<void> {
-  const { markDynamicUsage } = await import("./headers.js");
+  const { markDynamicUsage, DynamicServerError } = await import("./headers.js");
   markDynamicUsage();
+  // In static generation mode (build-time pre-rendering), connection() signals
+  // that the page requires a live server connection and cannot be pre-rendered.
+  if ((globalThis as any)[Symbol.for("vinext.staticGenerationMode")] === true) {
+    throw new DynamicServerError("connection()");
+  }
 }
 
 /**

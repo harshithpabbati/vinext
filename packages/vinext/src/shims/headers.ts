@@ -35,6 +35,7 @@ type VinextHeadersShimState = {
 //   headers/cookies/dynamic-usage state.
 const _ALS_KEY = Symbol.for("vinext.nextHeadersShim.als");
 const _FALLBACK_KEY = Symbol.for("vinext.nextHeadersShim.fallback");
+const _STATIC_GEN_KEY = Symbol.for("vinext.staticGenerationMode");
 const _g = globalThis as unknown as Record<PropertyKey, unknown>;
 const _als = (_g[_ALS_KEY] ??= new AsyncLocalStorage<VinextHeadersShimState>()) as AsyncLocalStorage<VinextHeadersShimState>;
 
@@ -48,6 +49,50 @@ const _fallbackState = (_g[_FALLBACK_KEY] ??= {
 function _getState(): VinextHeadersShimState {
   const state = _als.getStore();
   return state ?? _fallbackState;
+}
+
+// ---------------------------------------------------------------------------
+// Static generation mode
+// ---------------------------------------------------------------------------
+
+/**
+ * Error thrown when a dynamic API (cookies, headers, connection) is called
+ * during build-time static pre-rendering. The `digest` field is used to
+ * identify this error across module instances (e.g. via ssrLoadModule).
+ */
+export class DynamicServerError extends Error {
+  readonly digest = "DYNAMIC_SERVER_ERROR";
+  constructor(api: string) {
+    super(`Dynamic API \`${api}\` was called during static generation. This page will be rendered at request time instead.`);
+    this.name = "DynamicServerError";
+  }
+}
+
+/**
+ * Whether we are currently in build-time static generation mode.
+ * Stored on globalThis so it is shared across all module instances,
+ * including those loaded via server.ssrLoadModule().
+ */
+function isStaticGenerationMode(): boolean {
+  return (_g[_STATIC_GEN_KEY] as boolean) === true;
+}
+
+/**
+ * Enter static generation mode. In this mode, dynamic APIs (cookies,
+ * headers, connection) throw DynamicServerError instead of reading from
+ * the request context, signalling that the page cannot be pre-rendered.
+ *
+ * Call exitStaticGenerationMode() after rendering to restore normal behaviour.
+ */
+export function enterStaticGenerationMode(): void {
+  _g[_STATIC_GEN_KEY] = true;
+}
+
+/**
+ * Exit static generation mode.
+ */
+export function exitStaticGenerationMode(): void {
+  _g[_STATIC_GEN_KEY] = false;
 }
 
 /**
@@ -205,6 +250,9 @@ export function headersContextFromRequest(request: Request): HeadersContext {
  * the context is already available).
  */
 export async function headers(): Promise<Headers> {
+  if (isStaticGenerationMode()) {
+    throw new DynamicServerError("headers()");
+  }
   const state = _getState();
   if (!state.headersContext) {
     throw new Error(
@@ -221,6 +269,9 @@ export async function headers(): Promise<Headers> {
  * Returns a ReadonlyRequestCookies-like object.
  */
 export async function cookies(): Promise<RequestCookies> {
+  if (isStaticGenerationMode()) {
+    throw new DynamicServerError("cookies()");
+  }
   const state = _getState();
   if (!state.headersContext) {
     throw new Error(
