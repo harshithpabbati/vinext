@@ -57,6 +57,14 @@ export interface StaticExportOptions {
   outDir: string;
   /** Resolved next.config.js */
   config: ResolvedNextConfig;
+  /**
+   * When true, enables automatic build-time pre-rendering mode:
+   * - Skips pages with getServerSideProps (instead of erroring)
+   * - Skips dynamic routes without getStaticPaths (instead of erroring)
+   * - Allows getStaticPaths with any fallback value (renders known paths)
+   * Use this when pre-rendering as part of a normal server build (not output:'export').
+   */
+  prerenderMode?: boolean;
 }
 
 export interface StaticExportResult {
@@ -79,6 +87,7 @@ export async function staticExportPages(
   options: StaticExportOptions,
 ): Promise<StaticExportResult> {
   const { server, routes, apiRoutes, pagesDir, outDir, config } = options;
+  const prerenderMode = options.prerenderMode ?? false;
   const result: StaticExportResult = {
     pageCount: 0,
     files: [],
@@ -90,7 +99,7 @@ export async function staticExportPages(
   fs.mkdirSync(outDir, { recursive: true });
 
   // Warn about API routes
-  if (apiRoutes.length > 0) {
+  if (!prerenderMode && apiRoutes.length > 0) {
     result.warnings.push(
       `${apiRoutes.length} API route(s) skipped — API routes are not supported with output: 'export'`,
     );
@@ -110,8 +119,12 @@ export async function staticExportPages(
 
     const pageModule = await server.ssrLoadModule(route.filePath);
 
-    // Validate: getServerSideProps is not allowed with static export
+    // getServerSideProps pages are not statically renderable
     if (typeof pageModule.getServerSideProps === "function") {
+      if (prerenderMode) {
+        // In auto-prerender mode: skip SSR pages — they'll be rendered at runtime
+        continue;
+      }
       result.errors.push({
         route: route.pattern,
         error: `Page uses getServerSideProps which is not supported with output: 'export'. Use getStaticProps instead.`,
@@ -122,6 +135,10 @@ export async function staticExportPages(
     if (route.isDynamic) {
       // Dynamic route — must have getStaticPaths
       if (typeof pageModule.getStaticPaths !== "function") {
+        if (prerenderMode) {
+          // In auto-prerender mode: skip — will be SSR'd at runtime
+          continue;
+        }
         result.errors.push({
           route: route.pattern,
           error: `Dynamic route requires getStaticPaths with output: 'export'`,
@@ -135,7 +152,7 @@ export async function staticExportPages(
       });
       const fallback = pathsResult?.fallback ?? false;
 
-      if (fallback !== false) {
+      if (!prerenderMode && fallback !== false) {
         result.errors.push({
           route: route.pattern,
           error: `getStaticPaths must return fallback: false with output: 'export' (got: ${JSON.stringify(fallback)})`,
@@ -622,6 +639,13 @@ export interface AppStaticExportOptions {
   outDir: string;
   /** Resolved next.config.js */
   config: ResolvedNextConfig;
+  /**
+   * When true, enables automatic build-time pre-rendering mode:
+   * - Skips dynamic routes without generateStaticParams() (instead of erroring)
+   * - Skips pages that respond with Cache-Control: no-store (they use dynamic APIs)
+   * Use this when pre-rendering as part of a normal server build (not output:'export').
+   */
+  prerenderMode?: boolean;
 }
 
 /**
@@ -634,6 +658,7 @@ export async function staticExportApp(
   options: AppStaticExportOptions,
 ): Promise<StaticExportResult> {
   const { baseUrl, routes, server, outDir, config } = options;
+  const prerenderMode = options.prerenderMode ?? false;
   const result: StaticExportResult = {
     pageCount: 0,
     files: [],
@@ -649,9 +674,11 @@ export async function staticExportApp(
   for (const route of routes) {
     // Skip API route handlers — not supported in static export
     if (route.routePath && !route.pagePath) {
-      result.warnings.push(
-        `Route handler ${route.pattern} skipped — API routes are not supported with output: 'export'`,
-      );
+      if (!prerenderMode) {
+        result.warnings.push(
+          `Route handler ${route.pattern} skipped — API routes are not supported with output: 'export'`,
+        );
+      }
       continue;
     }
 
@@ -663,6 +690,10 @@ export async function staticExportApp(
         const pageModule = await server.ssrLoadModule(route.pagePath);
 
         if (typeof pageModule.generateStaticParams !== "function") {
+          if (prerenderMode) {
+            // In auto-prerender mode: skip — will be SSR'd at runtime
+            continue;
+          }
           result.errors.push({
             route: route.pattern,
             error: `Dynamic route requires generateStaticParams() with output: 'export'`,
@@ -727,6 +758,12 @@ export async function staticExportApp(
         continue;
       }
 
+      // In prerenderMode, skip pages that use dynamic APIs (cookies, headers, etc.)
+      // The dev server sets Cache-Control: no-store for dynamically rendered pages.
+      if (prerenderMode && res.headers.get("cache-control")?.includes("no-store")) {
+        continue;
+      }
+
       const html = await res.text();
       const outputPath = getOutputPath(urlPath, config.trailingSlash);
       const fullPath = path.join(outDir, outputPath);
@@ -743,20 +780,22 @@ export async function staticExportApp(
     }
   }
 
-  // Render 404 page
-  try {
-    const res = await fetch(`${baseUrl}/__nonexistent_page_for_404__`);
-    if (res.status === 404) {
-      const html = await res.text();
-      if (html.length > 0) {
-        const fullPath = path.join(outDir, "404.html");
-        fs.writeFileSync(fullPath, html, "utf-8");
-        result.files.push("404.html");
-        result.pageCount++;
+  // Render 404 page (only for full static export, not auto-prerender)
+  if (!prerenderMode) {
+    try {
+      const res = await fetch(`${baseUrl}/__nonexistent_page_for_404__`);
+      if (res.status === 404) {
+        const html = await res.text();
+        if (html.length > 0) {
+          const fullPath = path.join(outDir, "404.html");
+          fs.writeFileSync(fullPath, html, "utf-8");
+          result.files.push("404.html");
+          result.pageCount++;
+        }
       }
+    } catch {
+      // No custom 404, skip
     }
-  } catch {
-    // No custom 404, skip
   }
 
   return result;

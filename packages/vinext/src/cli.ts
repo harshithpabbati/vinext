@@ -329,6 +329,73 @@ async function buildApp() {
     });
   }
 
+  // ── Auto-prerender static pages ────────────────────────────────────────────
+  // After the Vite build, pre-render all statically-determinable pages to
+  // dist/prerendered/. The production server checks this directory before SSR,
+  // so static pages are served as HTML immediately on the first request —
+  // matching Next.js's build-time static page optimization.
+  //
+  // Dynamic pages (cookies(), headers(), searchParams usage) are detected via
+  // the Cache-Control: no-store response header and skipped automatically.
+  const prerenderDir = path.join(appRoot, "dist", "prerendered");
+  const { staticExportPages, staticExportApp } = await import(
+    "./build/static-export.js"
+  );
+
+  // Resolve a source directory, supporting both root-level and src/ layouts.
+  const resolveDir = (name: string) =>
+    fs.existsSync(path.join(appRoot, name))
+      ? path.join(appRoot, name)
+      : path.join(appRoot, "src", name);
+
+  const devServerConfig = buildViteConfig({ logLevel: "silent" });
+
+  if (isApp) {
+    const server = await vite.createServer(devServerConfig);
+    await server.listen();
+    const addr = server.httpServer?.address();
+    const port = typeof addr === "object" && addr ? addr.port : 3000;
+    const baseUrl = `http://localhost:${port}`;
+
+    try {
+      const { appRouter } = await import("./routing/app-router.js");
+      const appDir = resolveDir("app");
+      const routes = await appRouter(appDir);
+      const result = await staticExportApp({
+        baseUrl, routes, appDir, server,
+        outDir: prerenderDir,
+        config: nextConfig,
+        prerenderMode: true,
+      });
+      if (result.pageCount > 0) {
+        console.log(`\n  Pre-rendered ${result.pageCount} static page(s) to dist/prerendered/`);
+      }
+    } finally {
+      await server.close();
+    }
+  } else {
+    const server = await vite.createServer(devServerConfig);
+    await server.listen();
+
+    try {
+      const { pagesRouter, apiRouter } = await import("./routing/pages-router.js");
+      const pagesDir = resolveDir("pages");
+      const pageRoutes = await pagesRouter(pagesDir);
+      const apiRoutes = await apiRouter(pagesDir);
+      const result = await staticExportPages({
+        server, routes: pageRoutes, apiRoutes, pagesDir,
+        outDir: prerenderDir,
+        config: nextConfig,
+        prerenderMode: true,
+      });
+      if (result.pageCount > 0) {
+        console.log(`\n  Pre-rendered ${result.pageCount} static page(s) to dist/prerendered/`);
+      }
+    } finally {
+      await server.close();
+    }
+  }
+
   console.log("\n  Build complete. Run `vinext start` to start the production server.\n");
 }
 
