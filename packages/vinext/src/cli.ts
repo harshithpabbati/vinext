@@ -217,17 +217,86 @@ async function buildApp() {
 
   console.log(`\n  vinext build  (Vite ${getViteVersion()})\n`);
 
+  const appRoot = process.cwd();
   const isApp = hasAppDir();
+
+  // Check for output: 'export' in next.config
+  const { loadNextConfig, resolveNextConfig } = await import(
+    "./config/next-config.js"
+  );
+  const rawNextConfig = await loadNextConfig(appRoot);
+  const nextConfig = await resolveNextConfig(rawNextConfig);
+
+  if (nextConfig.output === "export") {
+    // Static export mode — render all pages to HTML at build time.
+    // Matches Next.js behavior: `next build` with output: 'export' writes
+    // pre-rendered HTML to out/ instead of producing a server bundle.
+    console.log("  Output mode: static export (output: 'export')\n");
+
+    const outDir = path.join(appRoot, "out");
+    const { staticExportPages, staticExportApp } = await import(
+      "./build/static-export.js"
+    );
+
+    // Resolve a source directory, supporting both root-level and src/ layouts.
+    const resolveDir = (name: string) =>
+      fs.existsSync(path.join(appRoot, name))
+        ? path.join(appRoot, name)
+        : path.join(appRoot, "src", name);
+
+    // Log warnings/errors and page count from a static export result.
+    const reportResult = (result: { warnings: string[]; errors: Array<{ route: string; error: string }>; pageCount: number }) => {
+      for (const w of result.warnings) console.warn(`  ⚠ ${w}`);
+      for (const e of result.errors) console.warn(`  ✗ ${e.route}: ${e.error}`);
+      console.log(`\n  Exported ${result.pageCount} pages to out/\n`);
+    };
+
+    const devServerConfig = buildViteConfig({ logLevel: "silent" });
+
+    if (isApp) {
+      // App Router: start a dev server, fetch each page as HTML, write to out/
+      const server = await vite.createServer(devServerConfig);
+      await server.listen();
+      const addr = server.httpServer?.address();
+      const port = typeof addr === "object" && addr ? addr.port : 3000;
+      const baseUrl = `http://localhost:${port}`;
+
+      try {
+        const { appRouter } = await import("./routing/app-router.js");
+        const appDir = resolveDir("app");
+        const routes = await appRouter(appDir);
+        const result = await staticExportApp({ baseUrl, routes, appDir, server, outDir, config: nextConfig });
+        reportResult(result);
+      } finally {
+        await server.close();
+      }
+    } else {
+      // Pages Router: start a dev server, render each page via SSR, write to out/
+      const server = await vite.createServer(devServerConfig);
+      await server.listen();
+
+      try {
+        const { pagesRouter, apiRouter } = await import("./routing/pages-router.js");
+        const pagesDir = resolveDir("pages");
+        const pageRoutes = await pagesRouter(pagesDir);
+        const apiRoutes = await apiRouter(pagesDir);
+        const result = await staticExportPages({ server, routes: pageRoutes, apiRoutes, pagesDir, outDir, config: nextConfig });
+        reportResult(result);
+      } finally {
+        await server.close();
+      }
+    }
+
+    return;
+  }
 
   if (isApp) {
     // App Router: use createBuilder for multi-environment RSC builds
-    const config = buildViteConfig();
-    const builder = await vite.createBuilder(config);
+    const viteConfig = buildViteConfig();
+    const builder = await vite.createBuilder(viteConfig);
     await builder.buildApp();
   } else {
     // Pages Router: client + SSR builds
-    const appRoot = process.cwd();
-
     console.log("  Building client...");
     await vite.build({
       root: appRoot,
